@@ -59,13 +59,22 @@ void onStart(ServiceInstance service) async {
 
   StreamSubscription<Position>? subscription;
   Timer? heartbeatTimer;
+  Timer? commandTimer;
   Position? ultimaPosicao;
   var encerrando = false;
+  var processandoComandos = false;
+
+  final headers = <String, String>{
+    'apikey': supabaseAnonKey,
+    'Authorization': 'Bearer $supabaseAnonKey',
+    'Content-Type': 'application/json',
+  };
 
   Future<void> encerrar() async {
     if (encerrando) return;
     encerrando = true;
     heartbeatTimer?.cancel();
+    commandTimer?.cancel();
     await subscription?.cancel();
     await service.stopSelf();
   }
@@ -78,8 +87,8 @@ void onStart(ServiceInstance service) async {
     return;
   }
 
-  Future<void> enviarPosicao(Position position, String evento) async {
-    if (encerrando) return;
+  Future<bool> enviarPosicao(Position position, String evento) async {
+    if (encerrando) return false;
     ultimaPosicao = position;
 
     final uri = Uri.parse('$supabaseUrl/rest/v1/locations');
@@ -98,23 +107,117 @@ void onStart(ServiceInstance service) async {
       final response = await http
           .post(
             uri,
-            headers: {
-              'apikey': supabaseAnonKey,
-              'Authorization': 'Bearer $supabaseAnonKey',
-              'Content-Type': 'application/json',
-              'Prefer': 'return=minimal',
-            },
+            headers: {...headers, 'Prefer': 'return=minimal'},
             body: jsonEncode(payload),
           )
           .timeout(const Duration(seconds: 15));
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        debugPrint('Falha ao enviar localização: ${response.statusCode} ${response.body}');
-      } else {
-        debugPrint('Localização enviada ($evento): ${position.latitude}, ${position.longitude}');
+        debugPrint(
+          'Falha ao enviar localização: ${response.statusCode} ${response.body}',
+        );
+        return false;
       }
+
+      debugPrint(
+        'Localização enviada ($evento): ${position.latitude}, ${position.longitude}',
+      );
+      return true;
     } catch (e) {
       debugPrint('Erro de rede ao enviar localização: $e');
+      return false;
+    }
+  }
+
+  Future<void> concluirComando(
+    int commandId, {
+    required bool sucesso,
+    String? erro,
+  }) async {
+    final uri = Uri.parse(
+      '$supabaseUrl/rest/v1/location_commands?id=eq.$commandId&status=eq.pending',
+    );
+
+    try {
+      await http
+          .patch(
+            uri,
+            headers: {...headers, 'Prefer': 'return=minimal'},
+            body: jsonEncode({
+              'status': sucesso ? 'completed' : 'failed',
+              'processed_at': DateTime.now().toUtc().toIso8601String(),
+              'error': sucesso ? null : (erro ?? 'Não foi possível obter a posição.'),
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+    } catch (e) {
+      debugPrint('Falha ao concluir comando $commandId: $e');
+    }
+  }
+
+  Future<void> verificarComandos() async {
+    if (encerrando || processandoComandos) return;
+    processandoComandos = true;
+
+    try {
+      final uri = Uri.parse(
+        '$supabaseUrl/rest/v1/location_commands'
+        '?select=id'
+        '&device_id=eq.$deviceId'
+        '&command=eq.locate_now'
+        '&status=eq.pending'
+        '&order=requested_at.asc'
+        '&limit=3',
+      );
+
+      final response = await http
+          .get(uri, headers: headers)
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        debugPrint(
+          'Falha ao consultar comandos: ${response.statusCode} ${response.body}',
+        );
+        return;
+      }
+
+      final lista = jsonDecode(response.body) as List<dynamic>;
+      for (final raw in lista) {
+        if (encerrando) break;
+        final item = raw as Map<String, dynamic>;
+        final commandId = (item['id'] as num).toInt();
+
+        try {
+          final position = await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.high,
+            ),
+          ).timeout(const Duration(seconds: 25));
+
+          final enviado = await enviarPosicao(position, 'manual');
+          await concluirComando(
+            commandId,
+            sucesso: enviado,
+            erro: enviado ? null : 'A posição foi obtida, mas não pôde ser enviada.',
+          );
+        } on TimeoutException {
+          await concluirComando(
+            commandId,
+            sucesso: false,
+            erro: 'Tempo limite para obter a localização.',
+          );
+        } catch (e) {
+          await concluirComando(
+            commandId,
+            sucesso: false,
+            erro: 'Erro ao obter localização: $e',
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Erro ao verificar comandos: $e');
+    } finally {
+      processandoComandos = false;
     }
   }
 
@@ -137,12 +240,22 @@ void onStart(ServiceInstance service) async {
     onError: (Object erro) => debugPrint('Erro no fluxo de localização: $erro'),
   );
 
-  heartbeatTimer = Timer.periodic(const Duration(minutes: 15), (_) async {
+  // Um heartbeat por minuto permite ao painel estimar Online/Offline sem
+  // misturar esses sinais com a linha do tempo visível do trajeto.
+  heartbeatTimer = Timer.periodic(const Duration(minutes: 1), (_) async {
     final position = ultimaPosicao;
     if (position != null && !encerrando) {
       await enviarPosicao(position, 'heartbeat');
     }
   });
+
+  // O painel cria um comando no Supabase. O serviço consulta a fila a cada
+  // poucos segundos e captura uma posição nova quando recebe locate_now.
+  commandTimer = Timer.periodic(
+    const Duration(seconds: 5),
+    (_) => verificarComandos(),
+  );
+  await verificarComandos();
 }
 
 class MeuApp extends StatelessWidget {
@@ -258,7 +371,9 @@ class _TelaConfiguracaoState extends State<TelaConfiguracao> {
 
   void _mostrar(String mensagem) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(mensagem)));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(mensagem)),
+    );
   }
 
   @override
