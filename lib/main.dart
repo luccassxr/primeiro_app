@@ -4,43 +4,44 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:sqflite/sqflite.dart';
 
 const String supabaseUrl = String.fromEnvironment('SUPABASE_URL');
 const String supabaseAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY');
-const String deviceId = String.fromEnvironment(
-  'DEVICE_ID',
-  defaultValue: 'celular-01',
-);
+const String deviceId = String.fromEnvironment('DEVICE_ID', defaultValue: 'celular-01');
 
 bool get backendConfigurado =>
     supabaseUrl.trim().isNotEmpty && supabaseAnonKey.trim().isNotEmpty;
 
-Map<String, String> get apiHeaders => <String, String>{
+Map<String, String> get apiHeaders => {
       'apikey': supabaseAnonKey,
       'Content-Type': 'application/json',
     };
 
-Map<String, dynamic> payloadDaPosicao(Position position, String evento) =>
-    <String, dynamic>{
+Map<String, dynamic> payloadDaPosicao(Position p, String evento) => {
       'device_id': deviceId,
-      'latitude': position.latitude,
-      'longitude': position.longitude,
-      'accuracy': position.accuracy,
-      'speed': position.speed,
-      'altitude': position.altitude,
+      'latitude': p.latitude,
+      'longitude': p.longitude,
+      'accuracy': p.accuracy,
+      'speed': p.speed,
+      'altitude': p.altitude,
       'event': evento,
       'client_time': DateTime.now().toUtc().toIso8601String(),
     };
 
+class EnvioResultado {
+  const EnvioResultado(this.sucesso, this.mensagem);
+  final bool sucesso;
+  final String mensagem;
+}
+
 Future<EnvioResultado> enviarPayload(Map<String, dynamic> payload) async {
   if (!backendConfigurado) {
-    return const EnvioResultado(false, 'Backend não configurado.');
+    return const EnvioResultado(false, 'Backend não configurado no APK.');
   }
-
   try {
     final response = await http
         .post(
@@ -49,16 +50,12 @@ Future<EnvioResultado> enviarPayload(Map<String, dynamic> payload) async {
           body: jsonEncode(payload),
         )
         .timeout(const Duration(seconds: 20));
-
     if (response.statusCode >= 200 && response.statusCode < 300) {
       return const EnvioResultado(true, 'Localização recebida pelo servidor.');
     }
-
-    final corpo = response.body.trim();
     return EnvioResultado(
       false,
-      'Servidor recusou o envio (${response.statusCode})'
-      '${corpo.isEmpty ? '' : ': $corpo'}',
+      'Servidor recusou (${response.statusCode}): ${response.body}',
     );
   } on TimeoutException {
     return const EnvioResultado(false, 'Tempo limite ao acessar o servidor.');
@@ -72,269 +69,199 @@ Future<Database> abrirFilaOffline() async {
   return openDatabase(
     '$pasta/localizador_fila.db',
     version: 1,
-    onCreate: (db, _) async {
-      await db.execute('''
-        CREATE TABLE fila_localizacoes (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          payload TEXT NOT NULL,
-          criado_em INTEGER NOT NULL
-        )
-      ''');
-    },
+    onCreate: (db, _) => db.execute('''
+      CREATE TABLE fila_localizacoes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        payload TEXT NOT NULL,
+        criado_em INTEGER NOT NULL
+      )
+    '''),
   );
 }
 
-Future<void> salvarNaFila(
-  Database db,
-  Map<String, dynamic> payload,
-) async {
+Future<void> salvarNaFila(Database db, Map<String, dynamic> payload) async {
   await db.insert('fila_localizacoes', {
     'payload': jsonEncode(payload),
     'criado_em': DateTime.now().millisecondsSinceEpoch,
   });
-
-  final count = Sqflite.firstIntValue(
+  final total = Sqflite.firstIntValue(
         await db.rawQuery('SELECT COUNT(*) FROM fila_localizacoes'),
       ) ??
       0;
-  if (count > 1000) {
+  if (total > 1000) {
     await db.rawDelete(
       'DELETE FROM fila_localizacoes WHERE id IN '
       '(SELECT id FROM fila_localizacoes ORDER BY id ASC LIMIT ?)',
-      [count - 1000],
+      [total - 1000],
     );
   }
 }
 
 Future<void> descarregarFila(Database db) async {
-  final itens = await db.query(
-    'fila_localizacoes',
-    orderBy: 'id ASC',
-    limit: 50,
-  );
-
+  final itens = await db.query('fila_localizacoes', orderBy: 'id ASC', limit: 30);
   for (final item in itens) {
-    final id = item['id'] as int;
     final payload = jsonDecode(item['payload'] as String) as Map<String, dynamic>;
     final resultado = await enviarPayload(payload);
     if (!resultado.sucesso) return;
-    await db.delete('fila_localizacoes', where: 'id = ?', whereArgs: [id]);
+    await db.delete('fila_localizacoes', where: 'id = ?', whereArgs: [item['id']]);
   }
-}
-
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await configurarServico();
-  runApp(const LocalizadorApp());
-}
-
-Future<void> configurarServico() async {
-  final service = FlutterBackgroundService();
-  await service.configure(
-    androidConfiguration: AndroidConfiguration(
-      onStart: onStart,
-      autoStart: false,
-      autoStartOnBoot: true,
-      isForegroundMode: true,
-      notificationChannelId: 'localizacao_service',
-      initialNotificationTitle: 'Localizador ativo',
-      initialNotificationContent: 'Compartilhamento de localização em execução',
-      foregroundServiceNotificationId: 888,
-      foregroundServiceTypes: const [AndroidForegroundType.location],
-    ),
-    iosConfiguration: IosConfiguration(
-      autoStart: false,
-      onForeground: onStart,
-    ),
-  );
 }
 
 @pragma('vm:entry-point')
-void onStart(ServiceInstance service) async {
+void startCallback() {
   DartPluginRegistrant.ensureInitialized();
+  FlutterForegroundTask.setTaskHandler(LocalizadorTaskHandler());
+}
 
-  if (service is AndroidServiceInstance) {
-    await service.setAsForegroundService();
-    await service.setForegroundNotificationInfo(
-      title: 'Localizador ativo',
-      content: 'Compartilhamento de localização em execução',
-    );
-  }
+class LocalizadorTaskHandler extends TaskHandler {
+  Database? _db;
+  Position? _ultimaEnviada;
+  DateTime? _ultimoHeartbeat;
+  bool _ocupado = false;
 
-  final db = await abrirFilaOffline();
-  StreamSubscription<Position>? subscription;
-  Timer? heartbeatTimer;
-  Timer? commandTimer;
-  Timer? retryTimer;
-  Position? ultimaPosicao;
-  bool encerrando = false;
-  bool processandoComandos = false;
-
-  Future<void> encerrar() async {
-    if (encerrando) return;
-    encerrando = true;
-    heartbeatTimer?.cancel();
-    commandTimer?.cancel();
-    retryTimer?.cancel();
-    await subscription?.cancel();
-    await db.close();
-    await service.stopSelf();
-  }
-
-  service.on('stop').listen((_) => encerrar());
-
-  if (!backendConfigurado) {
-    debugPrint('Backend não configurado.');
-    await encerrar();
-    return;
-  }
-
-  Future<bool> registrar(Position position, String evento) async {
-    if (encerrando) return false;
-    ultimaPosicao = position;
-    final payload = payloadDaPosicao(position, evento);
-
+  Future<bool> _registrar(Position p, String evento) async {
+    final db = _db;
+    if (db == null) return false;
     await descarregarFila(db);
+    final payload = payloadDaPosicao(p, evento);
     final resultado = await enviarPayload(payload);
-    if (resultado.sucesso) {
-      debugPrint('Localização enviada: $evento');
-      return true;
+    if (!resultado.sucesso) {
+      await salvarNaFila(db, payload);
+      return false;
     }
-
-    debugPrint('Envio falhou e foi enfileirado: ${resultado.mensagem}');
-    await salvarNaFila(db, payload);
-    return false;
+    _ultimaEnviada = p;
+    if (evento == 'heartbeat' || evento == 'startup') {
+      _ultimoHeartbeat = DateTime.now();
+    }
+    return true;
   }
 
-  Future<void> concluirComando(
-    int commandId, {
-    required bool sucesso,
-    String? erro,
-  }) async {
-    try {
-      final response = await http
-          .patch(
-            Uri.parse(
-              '$supabaseUrl/rest/v1/location_commands'
-              '?id=eq.$commandId&status=eq.pending',
-            ),
-            headers: {...apiHeaders, 'Prefer': 'return=minimal'},
-            body: jsonEncode({
-              'status': sucesso ? 'completed' : 'failed',
-              'processed_at': DateTime.now().toUtc().toIso8601String(),
-              'error': sucesso ? null : erro,
-            }),
-          )
-          .timeout(const Duration(seconds: 20));
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        debugPrint('Falha ao concluir comando: ${response.statusCode} ${response.body}');
-      }
-    } catch (e) {
-      debugPrint('Falha ao concluir comando: $e');
-    }
-  }
-
-  Future<void> verificarComandos() async {
-    if (encerrando || processandoComandos) return;
-    processandoComandos = true;
+  Future<void> _verificarComandos() async {
     try {
       final response = await http
           .get(
             Uri.parse(
               '$supabaseUrl/rest/v1/location_commands'
               '?select=id&device_id=eq.$deviceId&command=eq.locate_now'
-              '&status=eq.pending&order=requested_at.asc&limit=3',
+              '&status=eq.pending&order=requested_at.asc&limit=1',
             ),
             headers: apiHeaders,
           )
-          .timeout(const Duration(seconds: 20));
-
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        debugPrint('Falha ao consultar comandos: ${response.statusCode} ${response.body}');
-        return;
-      }
-
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode < 200 || response.statusCode >= 300) return;
       final lista = jsonDecode(response.body) as List<dynamic>;
-      for (final raw in lista) {
-        final commandId = ((raw as Map<String, dynamic>)['id'] as num).toInt();
-        try {
-          final position = await Geolocator.getCurrentPosition(
-            locationSettings: const LocationSettings(
-              accuracy: LocationAccuracy.high,
-            ),
-          ).timeout(const Duration(seconds: 30));
-          final enviado = await registrar(position, 'manual');
-          await concluirComando(
-            commandId,
-            sucesso: enviado,
-            erro: enviado ? null : 'Sem conexão com o servidor; posição ficou na fila local.',
-          );
-        } catch (e) {
-          await concluirComando(
-            commandId,
-            sucesso: false,
-            erro: 'Falha ao obter posição: $e',
-          );
-        }
+      if (lista.isEmpty) return;
+      final id = ((lista.first as Map<String, dynamic>)['id'] as num).toInt();
+
+      bool sucesso = false;
+      String? erro;
+      try {
+        final p = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+        ).timeout(const Duration(seconds: 25));
+        sucesso = await _registrar(p, 'manual');
+        if (!sucesso) erro = 'Posição salva localmente; servidor indisponível.';
+      } catch (e) {
+        erro = 'Falha ao obter posição: $e';
       }
-    } catch (e) {
-      debugPrint('Erro ao verificar comandos: $e');
-    } finally {
-      processandoComandos = false;
-    }
+
+      await http.patch(
+        Uri.parse('$supabaseUrl/rest/v1/location_commands?id=eq.$id&status=eq.pending'),
+        headers: {...apiHeaders, 'Prefer': 'return=minimal'},
+        body: jsonEncode({
+          'status': sucesso ? 'completed' : 'failed',
+          'processed_at': DateTime.now().toUtc().toIso8601String(),
+          'error': sucesso ? null : erro,
+        }),
+      ).timeout(const Duration(seconds: 15));
+    } catch (_) {}
   }
 
-  try {
-    await descarregarFila(db);
-    final inicial = await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-      ),
-    ).timeout(const Duration(seconds: 30));
-    await registrar(inicial, 'startup');
-  } catch (e) {
-    debugPrint('Falha na posição inicial: $e');
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    _db = await abrirFilaOffline();
+    await descarregarFila(_db!);
+    try {
+      final p = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      ).timeout(const Duration(seconds: 30));
+      await _registrar(p, 'startup');
+    } catch (_) {}
   }
 
-  subscription = Geolocator.getPositionStream(
-    locationSettings: const LocationSettings(
-      accuracy: LocationAccuracy.medium,
-      distanceFilter: 50,
-    ),
-  ).listen(
-    (position) => registrar(position, 'movement'),
-    onError: (Object erro) => debugPrint('Erro no fluxo de localização: $erro'),
-  );
+  @override
+  void onRepeatEvent(DateTime timestamp) {
+    if (_ocupado) return;
+    _ocupado = true;
+    () async {
+      try {
+        await _verificarComandos();
+        final agora = DateTime.now();
+        final heartbeatVencido = _ultimoHeartbeat == null ||
+            agora.difference(_ultimoHeartbeat!) >= const Duration(minutes: 5);
 
-  heartbeatTimer = Timer.periodic(const Duration(minutes: 5), (_) async {
-    final position = ultimaPosicao;
-    if (position != null && !encerrando) {
-      await registrar(position, 'heartbeat');
-    }
-  });
+        final p = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(accuracy: LocationAccuracy.medium),
+        ).timeout(const Duration(seconds: 20));
 
-  commandTimer = Timer.periodic(
-    const Duration(seconds: 30),
-    (_) => verificarComandos(),
-  );
+        final anterior = _ultimaEnviada;
+        final moveu = anterior == null ||
+            Geolocator.distanceBetween(
+                  anterior.latitude,
+                  anterior.longitude,
+                  p.latitude,
+                  p.longitude,
+                ) >=
+                50;
 
-  retryTimer = Timer.periodic(const Duration(minutes: 2), (_) async {
-    if (!encerrando) await descarregarFila(db);
-  });
+        if (moveu) {
+          await _registrar(p, 'movement');
+        } else if (heartbeatVencido) {
+          await _registrar(p, 'heartbeat');
+        } else if (_db != null) {
+          await descarregarFila(_db!);
+        }
+      } catch (_) {
+      } finally {
+        _ocupado = false;
+      }
+    }();
+  }
 
-  await verificarComandos();
+  @override
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
+    await _db?.close();
+    _db = null;
+  }
 }
 
-class EnvioResultado {
-  const EnvioResultado(this.sucesso, this.mensagem);
-
-  final bool sucesso;
-  final String mensagem;
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  FlutterForegroundTask.initCommunicationPort();
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'localizacao_service',
+      channelName: 'Localização em segundo plano',
+      channelDescription: 'Mantém o compartilhamento de localização ativo.',
+      onlyAlertOnce: true,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: false,
+      playSound: false,
+    ),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.repeat(30000),
+      autoRunOnBoot: false,
+      autoRunOnMyPackageReplaced: false,
+      allowWakeLock: true,
+      allowWifiLock: false,
+    ),
+  );
+  runApp(const LocalizadorApp());
 }
 
 class LocalizadorApp extends StatelessWidget {
   const LocalizadorApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -348,7 +275,6 @@ class LocalizadorApp extends StatelessWidget {
 
 class TelaAtivacao extends StatefulWidget {
   const TelaAtivacao({super.key});
-
   @override
   State<TelaAtivacao> createState() => _TelaAtivacaoState();
 }
@@ -364,145 +290,125 @@ class _TelaAtivacaoState extends State<TelaAtivacao> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _verificarAoAbrir());
   }
 
-  void _estado(String novoTitulo, String novoDetalhe, bool carregando) {
+  void _estado(String t, String d, bool p) {
     if (!mounted) return;
     setState(() {
-      titulo = novoTitulo;
-      detalhe = novoDetalhe;
-      processando = carregando;
+      titulo = t;
+      detalhe = d;
+      processando = p;
     });
   }
 
-  Future<void> _fecharApp() async {
-    await Future<void>.delayed(const Duration(milliseconds: 900));
-    if (mounted) await SystemNavigator.pop();
-  }
-
   Future<bool> _validarEnvioAgora() async {
-    _estado('Testando conexão', 'Obtendo uma localização atual…', true);
+    _estado('Testando localização', 'Obtendo posição atual…', true);
     try {
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
+      final p = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
       ).timeout(const Duration(seconds: 30));
-
-      _estado('Testando conexão', 'Enviando a localização ao servidor…', true);
-      final resultado = await enviarPayload(payloadDaPosicao(position, 'startup'));
-      if (!resultado.sucesso) {
-        _estado(
-          'Não foi possível enviar',
-          '${resultado.mensagem}\n\nO aplicativo não será fechado para você conseguir ver o erro.',
-          false,
-        );
+      _estado('Testando servidor', 'Enviando posição ao servidor…', true);
+      final r = await enviarPayload(payloadDaPosicao(p, 'startup'));
+      if (!r.sucesso) {
+        _estado('Falha no envio', r.mensagem, false);
         return false;
       }
       return true;
     } catch (e) {
-      _estado(
-        'Não foi possível obter a localização',
-        'Verifique se o GPS está ligado e tente novamente. Detalhe: $e',
-        false,
-      );
+      _estado('Falha no GPS', 'Não foi possível obter a posição: $e', false);
+      return false;
+    }
+  }
+
+  Future<bool> _iniciarServico() async {
+    try {
+      final permissaoNotificacao = await FlutterForegroundTask.checkNotificationPermission();
+      if (permissaoNotificacao != NotificationPermission.granted) {
+        await FlutterForegroundTask.requestNotificationPermission();
+      }
+
+      if (!await FlutterForegroundTask.isRunningService) {
+        await FlutterForegroundTask.startService(
+          serviceId: 888,
+          serviceTypes: const [ForegroundServiceTypes.location],
+          notificationTitle: 'Localizador ativo',
+          notificationText: 'Compartilhamento de localização em execução',
+          callback: startCallback,
+        );
+      }
+      await Future<void>.delayed(const Duration(seconds: 1));
+      return await FlutterForegroundTask.isRunningService;
+    } catch (e) {
+      _estado('Falha ao iniciar serviço', '$e', false);
       return false;
     }
   }
 
   Future<void> _iniciarEValidar() async {
-    final service = FlutterBackgroundService();
-    if (!await service.isRunning()) {
-      await service.startService();
-      await Future<void>.delayed(const Duration(milliseconds: 800));
-    }
-
+    // Primeiro confirma GPS -> Supabase com o app aberto. Só depois inicia o serviço.
     if (!await _validarEnvioAgora()) return;
-
-    _estado(
-      'Tudo certo',
-      'Localização confirmada pelo servidor. O serviço continuará em segundo plano.',
-      true,
-    );
-    await _fecharApp();
-  }
-
-  Future<void> _verificarAoAbrir() async {
-    if (!backendConfigurado) {
+    _estado('Localização confirmada', 'Iniciando serviço em segundo plano…', true);
+    if (!await _iniciarServico()) {
       _estado(
-        'Configuração incompleta',
-        'Este APK foi gerado sem acesso ao servidor. Instale uma versão atualizada.',
+        'Localização chegou ao servidor',
+        'O envio inicial funcionou, mas o serviço em segundo plano não iniciou. Não vou fechar o app.',
         false,
       );
       return;
     }
+    _estado(
+      'Tudo certo',
+      'Localização confirmada e serviço ativo em segundo plano.',
+      true,
+    );
+    await Future<void>.delayed(const Duration(seconds: 1));
+    if (mounted) await SystemNavigator.pop();
+  }
 
-    final localizacaoAtiva = await Geolocator.isLocationServiceEnabled();
+  Future<void> _verificarAoAbrir() async {
+    if (!backendConfigurado) {
+      _estado('Configuração incompleta', 'APK sem configuração do servidor.', false);
+      return;
+    }
+    final gps = await Geolocator.isLocationServiceEnabled();
     final permissao = await Geolocator.checkPermission();
-
-    if (localizacaoAtiva && permissao == LocationPermission.always) {
+    if (gps && permissao == LocationPermission.always) {
       await _iniciarEValidar();
       return;
     }
-
     _estado(
       'Ativar localização',
-      'Toque abaixo e conclua a autorização. O app só fechará depois de confirmar que a posição chegou ao servidor.',
+      'Permita a localização o tempo todo. O app só fecha depois de confirmar o envio.',
       false,
     );
   }
 
   Future<void> configurar() async {
     if (processando) return;
-    _estado('Configurando', 'Verificando as permissões necessárias…', true);
-
-    try {
-      if (!await Geolocator.isLocationServiceEnabled()) {
-        _estado(
-          'Ative a localização do celular',
-          'Ligue a Localização/GPS e volte para este aplicativo.',
-          false,
-        );
-        await Geolocator.openLocationSettings();
-        return;
-      }
-
-      var permissao = await Geolocator.checkPermission();
-      if (permissao == LocationPermission.denied) {
-        permissao = await Geolocator.requestPermission();
-      }
-
-      if (permissao == LocationPermission.deniedForever) {
-        _estado(
-          'Permissão bloqueada',
-          'Abra as configurações e permita o acesso à localização.',
-          false,
-        );
-        await Geolocator.openAppSettings();
-        return;
-      }
-
-      if (permissao == LocationPermission.denied) {
-        _estado(
-          'Permissão necessária',
-          'O aplicativo precisa da localização para funcionar.',
-          false,
-        );
-        return;
-      }
-
-      if (permissao != LocationPermission.always) {
-        _estado(
-          'Permita o tempo todo',
-          'Na tela que será aberta, entre em Localização e escolha “Permitir o tempo todo”. Depois volte ao app.',
-          false,
-        );
-        await Geolocator.openAppSettings();
-        return;
-      }
-
-      await _iniciarEValidar();
-    } catch (e) {
-      _estado('Não foi possível ativar', 'Detalhe: $e', false);
+    _estado('Configurando', 'Verificando permissões…', true);
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      _estado('Ative o GPS', 'Ligue a localização do celular e volte.', false);
+      await Geolocator.openLocationSettings();
+      return;
     }
+
+    var permissao = await Geolocator.checkPermission();
+    if (permissao == LocationPermission.denied) {
+      permissao = await Geolocator.requestPermission();
+    }
+    if (permissao == LocationPermission.deniedForever) {
+      _estado('Permissão bloqueada', 'Abra as configurações e permita localização.', false);
+      await Geolocator.openAppSettings();
+      return;
+    }
+    if (permissao != LocationPermission.always) {
+      _estado(
+        'Permita o tempo todo',
+        'Nas configurações de Localização escolha “Permitir o tempo todo” e volte ao app.',
+        false,
+      );
+      await Geolocator.openAppSettings();
+      return;
+    }
+    await _iniciarEValidar();
   }
 
   @override
@@ -521,21 +427,12 @@ class _TelaAtivacaoState extends State<TelaAtivacao> {
                   const SizedBox(height: 22),
                   const Text(
                     'Localizador',
-                    textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700),
                   ),
                   const SizedBox(height: 24),
-                  Text(
-                    titulo,
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    detalhe,
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.bodyLarge,
-                  ),
+                  Text(titulo, textAlign: TextAlign.center, style: Theme.of(context).textTheme.titleLarge),
+                  const SizedBox(height: 8),
+                  Text(detalhe, textAlign: TextAlign.center),
                   const SizedBox(height: 28),
                   if (processando)
                     const CircularProgressIndicator()
@@ -545,12 +442,12 @@ class _TelaAtivacaoState extends State<TelaAtivacao> {
                       child: FilledButton.icon(
                         onPressed: configurar,
                         icon: const Icon(Icons.location_on_outlined),
-                        label: const Text('Verificar e ativar'),
+                        label: const Text('Tentar novamente'),
                       ),
                     ),
                   const SizedBox(height: 18),
                   Text(
-                    'Quando estiver ativo, o Android mantém uma notificação visível enquanto a localização estiver sendo compartilhada.',
+                    'Quando ativo, o Android mantém uma notificação visível enquanto a localização é compartilhada.',
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
