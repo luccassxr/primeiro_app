@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
@@ -20,7 +21,7 @@ bool get backendConfigurado =>
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await configurarServico();
-  runApp(const MeuApp());
+  runApp(const LocalizadorApp());
 }
 
 Future<void> configurarServico() async {
@@ -33,8 +34,8 @@ Future<void> configurarServico() async {
       autoStartOnBoot: true,
       isForegroundMode: true,
       notificationChannelId: 'localizacao_service',
-      initialNotificationTitle: 'Localização ativa',
-      initialNotificationContent: 'Monitoramento autorizado em execução',
+      initialNotificationTitle: 'Localizador ativo',
+      initialNotificationContent: 'Compartilhamento de localização em execução',
       foregroundServiceNotificationId: 888,
       foregroundServiceTypes: const [AndroidForegroundType.location],
     ),
@@ -52,8 +53,8 @@ void onStart(ServiceInstance service) async {
   if (service is AndroidServiceInstance) {
     await service.setAsForegroundService();
     await service.setForegroundNotificationInfo(
-      title: 'Localização ativa',
-      content: 'Monitoramento autorizado em execução',
+      title: 'Localizador ativo',
+      content: 'Compartilhamento de localização em execução',
     );
   }
 
@@ -64,9 +65,10 @@ void onStart(ServiceInstance service) async {
   var encerrando = false;
   var processandoComandos = false;
 
+  // A chave publishable identifica o app via apikey. Ela NÃO deve ser enviada
+  // como Bearer token, pois sb_publishable_* não é um JWT.
   final headers = <String, String>{
     'apikey': supabaseAnonKey,
-    'Authorization': 'Bearer $supabaseAnonKey',
     'Content-Type': 'application/json',
   };
 
@@ -139,7 +141,7 @@ void onStart(ServiceInstance service) async {
     );
 
     try {
-      await http
+      final response = await http
           .patch(
             uri,
             headers: {...headers, 'Prefer': 'return=minimal'},
@@ -150,6 +152,13 @@ void onStart(ServiceInstance service) async {
             }),
           )
           .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        debugPrint(
+          'Falha ao concluir comando $commandId: '
+          '${response.statusCode} ${response.body}',
+        );
+      }
     } catch (e) {
       debugPrint('Falha ao concluir comando $commandId: $e');
     }
@@ -223,8 +232,10 @@ void onStart(ServiceInstance service) async {
 
   try {
     final inicial = await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
-    );
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+      ),
+    ).timeout(const Duration(seconds: 30));
     await enviarPosicao(inicial, 'startup');
   } catch (e) {
     debugPrint('Não foi possível obter a posição inicial: $e');
@@ -240,8 +251,6 @@ void onStart(ServiceInstance service) async {
     onError: (Object erro) => debugPrint('Erro no fluxo de localização: $erro'),
   );
 
-  // Um heartbeat por minuto permite ao painel estimar Online/Offline sem
-  // misturar esses sinais com a linha do tempo visível do trajeto.
   heartbeatTimer = Timer.periodic(const Duration(minutes: 1), (_) async {
     final position = ultimaPosicao;
     if (position != null && !encerrando) {
@@ -249,8 +258,6 @@ void onStart(ServiceInstance service) async {
     }
   });
 
-  // O painel cria um comando no Supabase. O serviço consulta a fila a cada
-  // poucos segundos e captura uma posição nova quando recebe locate_now.
   commandTimer = Timer.periodic(
     const Duration(seconds: 5),
     (_) => verificarComandos(),
@@ -258,62 +265,104 @@ void onStart(ServiceInstance service) async {
   await verificarComandos();
 }
 
-class MeuApp extends StatelessWidget {
-  const MeuApp({super.key});
+class LocalizadorApp extends StatelessWidget {
+  const LocalizadorApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Rastreador interno',
+      title: 'Localizador',
       theme: ThemeData(useMaterial3: true),
-      home: const TelaConfiguracao(),
+      home: const TelaAtivacao(),
     );
   }
 }
 
-class TelaConfiguracao extends StatefulWidget {
-  const TelaConfiguracao({super.key});
+class TelaAtivacao extends StatefulWidget {
+  const TelaAtivacao({super.key});
 
   @override
-  State<TelaConfiguracao> createState() => _TelaConfiguracaoState();
+  State<TelaAtivacao> createState() => _TelaAtivacaoState();
 }
 
-class _TelaConfiguracaoState extends State<TelaConfiguracao> {
-  String status = 'Aguardando autorização';
-  bool processando = false;
-  bool ativo = false;
+class _TelaAtivacaoState extends State<TelaAtivacao> {
+  bool processando = true;
+  String titulo = 'Verificando configuração';
+  String detalhe = 'Aguarde um instante…';
 
   @override
   void initState() {
     super.initState();
-    _carregarStatus();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _verificarAoAbrir());
   }
 
-  Future<void> _carregarStatus() async {
-    final executando = await FlutterBackgroundService().isRunning();
+  Future<void> _fecharApp() async {
+    await Future<void>.delayed(const Duration(milliseconds: 700));
+    if (!mounted) return;
+    await SystemNavigator.pop();
+  }
+
+  Future<void> _verificarAoAbrir() async {
+    if (!backendConfigurado) {
+      _estado(
+        'Configuração incompleta',
+        'Este APK foi gerado sem acesso ao servidor. Instale uma versão atualizada.',
+        false,
+      );
+      return;
+    }
+
+    final localizacaoAtiva = await Geolocator.isLocationServiceEnabled();
+    final permissao = await Geolocator.checkPermission();
+
+    if (localizacaoAtiva && permissao == LocationPermission.always) {
+      final service = FlutterBackgroundService();
+      if (!await service.isRunning()) {
+        await service.startService();
+      }
+
+      if (!mounted) return;
+      _estado(
+        'Localização ativa',
+        'O serviço está funcionando em segundo plano.',
+        true,
+      );
+      await _fecharApp();
+      return;
+    }
+
+    _estado(
+      'Ativar localização',
+      'Faça a configuração uma única vez. Depois, o serviço funciona em segundo plano.',
+      false,
+    );
+  }
+
+  void _estado(String novoTitulo, String novoDetalhe, bool carregando) {
     if (!mounted) return;
     setState(() {
-      ativo = executando;
-      status = executando ? 'Monitoramento ativo' : 'Aguardando autorização';
+      titulo = novoTitulo;
+      detalhe = novoDetalhe;
+      processando = carregando;
     });
   }
 
-  Future<void> ativarMonitoramento() async {
+  Future<void> configurar() async {
     if (processando) return;
-    setState(() => processando = true);
+    setState(() {
+      processando = true;
+      titulo = 'Configurando';
+      detalhe = 'Verificando as permissões necessárias…';
+    });
 
     try {
-      if (!backendConfigurado) {
-        _mostrar(
-          'Este APK foi compilado sem SUPABASE_URL/SUPABASE_ANON_KEY. '
-          'Configure os secrets do GitHub e gere outro APK.',
-        );
-        return;
-      }
-
       if (!await Geolocator.isLocationServiceEnabled()) {
-        if (mounted) setState(() => status = 'Ative a localização do celular');
+        _estado(
+          'Ative a localização do celular',
+          'Ligue a Localização/GPS e volte para este aplicativo.',
+          false,
+        );
         await Geolocator.openLocationSettings();
         return;
       }
@@ -324,22 +373,29 @@ class _TelaConfiguracaoState extends State<TelaConfiguracao> {
       }
 
       if (permissao == LocationPermission.deniedForever) {
-        if (mounted) setState(() => status = 'Permissão bloqueada');
-        _mostrar('Abra as configurações do app e permita localização.');
+        _estado(
+          'Permissão bloqueada',
+          'Abra as configurações e permita o acesso à localização.',
+          false,
+        );
         await Geolocator.openAppSettings();
         return;
       }
 
       if (permissao == LocationPermission.denied) {
-        if (mounted) setState(() => status = 'Permissão negada');
+        _estado(
+          'Permissão necessária',
+          'O aplicativo precisa da localização para funcionar.',
+          false,
+        );
         return;
       }
 
       if (permissao != LocationPermission.always) {
-        if (mounted) setState(() => status = 'Falta permitir em segundo plano');
-        _mostrar(
-          'Nas configurações do app, escolha Localização > Permitir o tempo todo. '
-          'Depois volte e toque em Ativar novamente.',
+        _estado(
+          'Permita o tempo todo',
+          'Na tela que será aberta, entre em Localização e escolha “Permitir o tempo todo”. Depois volte para o app.',
+          false,
         );
         await Geolocator.openAppSettings();
         return;
@@ -351,29 +407,19 @@ class _TelaConfiguracaoState extends State<TelaConfiguracao> {
       }
 
       if (!mounted) return;
-      setState(() {
-        ativo = true;
-        status = 'Monitoramento ativo';
-      });
-    } finally {
-      if (mounted) setState(() => processando = false);
+      _estado(
+        'Pronto',
+        'Localização ativada. Você não precisa manter este aplicativo aberto.',
+        true,
+      );
+      await _fecharApp();
+    } catch (e) {
+      _estado(
+        'Não foi possível ativar',
+        'Tente novamente. Detalhe: $e',
+        false,
+      );
     }
-  }
-
-  Future<void> desativarMonitoramento() async {
-    FlutterBackgroundService().invoke('stop');
-    if (!mounted) return;
-    setState(() {
-      ativo = false;
-      status = 'Monitoramento desativado';
-    });
-  }
-
-  void _mostrar(String mensagem) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(mensagem)),
-    );
   }
 
   @override
@@ -381,36 +427,52 @@ class _TelaConfiguracaoState extends State<TelaConfiguracao> {
     return Scaffold(
       body: SafeArea(
         child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.location_on, size: 64),
-                const SizedBox(height: 16),
-                Text(
-                  status,
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: 24),
-                if (!ativo)
-                  FilledButton(
-                    onPressed: processando ? null : ativarMonitoramento,
-                    child: Text(processando ? 'Configurando...' : 'Ativar'),
-                  )
-                else
-                  OutlinedButton(
-                    onPressed: desativarMonitoramento,
-                    child: const Text('Desativar'),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(28),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.my_location_rounded, size: 76),
+                  const SizedBox(height: 22),
+                  const Text(
+                    'Localizador',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700),
                   ),
-                const SizedBox(height: 12),
-                const Text(
-                  'Após a autorização, o serviço continua em segundo plano e '
-                  'mantém uma notificação do Android enquanto estiver ativo.',
-                  textAlign: TextAlign.center,
-                ),
-              ],
+                  const SizedBox(height: 24),
+                  Text(
+                    titulo,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    detalhe,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodyLarge,
+                  ),
+                  const SizedBox(height: 28),
+                  if (processando)
+                    const CircularProgressIndicator()
+                  else
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: configurar,
+                        icon: const Icon(Icons.location_on_outlined),
+                        label: const Text('Configurar localização'),
+                      ),
+                    ),
+                  const SizedBox(height: 18),
+                  Text(
+                    'Quando estiver ativo, o Android mostrará uma notificação permanente enquanto a localização estiver sendo compartilhada.',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
             ),
           ),
         ),
