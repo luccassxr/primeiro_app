@@ -29,6 +29,13 @@ class PainelApp extends StatelessWidget {
   }
 }
 
+class SessionData {
+  SessionData({required this.accessToken, required this.refreshToken});
+
+  String accessToken;
+  final String refreshToken;
+}
+
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
 
@@ -64,10 +71,11 @@ class _LoginPageState extends State<LoginPage> {
           'email': email.text.trim(),
           'password': senha.text,
         }),
-      );
+      ).timeout(const Duration(seconds: 20));
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
         final body = jsonDecode(response.body) as Map<String, dynamic>;
+        if (!mounted) return;
         setState(() {
           erro = (body['msg'] ?? body['error_description'] ?? 'Falha no login')
               .toString();
@@ -76,18 +84,29 @@ class _LoginPageState extends State<LoginPage> {
       }
 
       final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final token = data['access_token']?.toString();
-      if (token == null || token.isEmpty) {
-        setState(() => erro = 'Token de acesso não recebido.');
+      final accessToken = data['access_token']?.toString() ?? '';
+      final refreshToken = data['refresh_token']?.toString() ?? '';
+
+      if (accessToken.isEmpty || refreshToken.isEmpty) {
+        if (mounted) setState(() => erro = 'Sessão não recebida do servidor.');
         return;
       }
 
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => PainelPage(accessToken: token)),
+        MaterialPageRoute(
+          builder: (_) => PainelPage(
+            session: SessionData(
+              accessToken: accessToken,
+              refreshToken: refreshToken,
+            ),
+          ),
+        ),
       );
+    } on TimeoutException {
+      if (mounted) setState(() => erro = 'O servidor demorou para responder.');
     } catch (e) {
-      setState(() => erro = 'Erro de rede: $e');
+      if (mounted) setState(() => erro = 'Erro de rede: $e');
     } finally {
       if (mounted) setState(() => carregando = false);
     }
@@ -116,6 +135,7 @@ class _LoginPageState extends State<LoginPage> {
                 TextField(
                   controller: email,
                   keyboardType: TextInputType.emailAddress,
+                  textInputAction: TextInputAction.next,
                   decoration: const InputDecoration(
                     labelText: 'E-mail',
                     border: OutlineInputBorder(),
@@ -125,6 +145,7 @@ class _LoginPageState extends State<LoginPage> {
                 TextField(
                   controller: senha,
                   obscureText: true,
+                  onSubmitted: (_) => entrar(),
                   decoration: const InputDecoration(
                     labelText: 'Senha',
                     border: OutlineInputBorder(),
@@ -156,9 +177,9 @@ class _LoginPageState extends State<LoginPage> {
 }
 
 class PainelPage extends StatefulWidget {
-  const PainelPage({super.key, required this.accessToken});
+  const PainelPage({super.key, required this.session});
 
-  final String accessToken;
+  final SessionData session;
 
   @override
   State<PainelPage> createState() => _PainelPageState();
@@ -170,6 +191,7 @@ class _PainelPageState extends State<PainelPage> {
   List<LocationRecord> historico = [];
   int? ultimoId;
   bool carregando = true;
+  bool atualizando = false;
   String? erro;
 
   @override
@@ -179,7 +201,29 @@ class _PainelPageState extends State<PainelPage> {
     timer = Timer.periodic(const Duration(seconds: 10), (_) => atualizar());
   }
 
-  Future<void> atualizar() async {
+  Future<bool> renovarSessao() async {
+    try {
+      final response = await http.post(
+        Uri.parse('$supabaseUrl/auth/v1/token?grant_type=refresh_token'),
+        headers: {
+          'apikey': supabaseAnonKey,
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({'refresh_token': widget.session.refreshToken}),
+      ).timeout(const Duration(seconds: 20));
+
+      if (response.statusCode < 200 || response.statusCode >= 300) return false;
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final token = data['access_token']?.toString() ?? '';
+      if (token.isEmpty) return false;
+      widget.session.accessToken = token;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<http.Response> consultar() {
     final uri = Uri.parse(
       '$supabaseUrl/rest/v1/locations'
       '?select=id,device_id,latitude,longitude,accuracy,speed,event,client_time,created_at'
@@ -188,19 +232,31 @@ class _PainelPageState extends State<PainelPage> {
       '&limit=100',
     );
 
+    return http.get(
+      uri,
+      headers: {
+        'apikey': supabaseAnonKey,
+        'Authorization': 'Bearer ${widget.session.accessToken}',
+      },
+    ).timeout(const Duration(seconds: 20));
+  }
+
+  Future<void> atualizar() async {
+    if (atualizando) return;
+    atualizando = true;
+
     try {
-      final response = await http.get(
-        uri,
-        headers: {
-          'apikey': supabaseAnonKey,
-          'Authorization': 'Bearer ${widget.accessToken}',
-        },
-      );
+      var response = await consultar();
+      if (response.statusCode == 401 && await renovarSessao()) {
+        response = await consultar();
+      }
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
         if (!mounted) return;
         setState(() {
-          erro = 'Falha ao consultar localização (${response.statusCode}).';
+          erro = response.statusCode == 401
+              ? 'Sessão expirada. Entre novamente.'
+              : 'Falha ao consultar localização (${response.statusCode}).';
           carregando = false;
         });
         return;
@@ -211,12 +267,14 @@ class _PainelPageState extends State<PainelPage> {
           .map((e) => LocationRecord.fromJson(e as Map<String, dynamic>))
           .toList();
 
-      final atual = novos.isEmpty ? null : novos.first;
-      final houveMovimento = atual != null &&
-          ultimoId != null &&
-          atual.id != ultimoId &&
-          atual.event == 'movement';
+      final idAnterior = ultimoId;
+      final novosMovimentos = idAnterior == null
+          ? <LocationRecord>[]
+          : novos
+              .where((e) => e.id > idAnterior && e.event == 'movement')
+              .toList();
 
+      final atual = novos.isEmpty ? null : novos.first;
       if (atual != null) ultimoId = atual.id;
 
       if (!mounted) return;
@@ -230,23 +288,40 @@ class _PainelPageState extends State<PainelPage> {
         mapController.move(LatLng(atual.latitude, atual.longitude), 16);
       }
 
-      if (houveMovimento && mounted) {
+      if (novosMovimentos.isNotEmpty && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Movimento detectado.')),
+          SnackBar(
+            content: Text(
+              novosMovimentos.length == 1
+                  ? 'Movimento detectado.'
+                  : '${novosMovimentos.length} movimentos novos detectados.',
+            ),
+          ),
         );
       }
+    } on TimeoutException {
+      if (mounted) {
+        setState(() {
+          erro = 'O servidor demorou para responder.';
+          carregando = false;
+        });
+      }
     } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        erro = 'Erro de rede: $e';
-        carregando = false;
-      });
+      if (mounted) {
+        setState(() {
+          erro = 'Erro de rede: $e';
+          carregando = false;
+        });
+      }
+    } finally {
+      atualizando = false;
     }
   }
 
   @override
   void dispose() {
     timer?.cancel();
+    mapController.dispose();
     super.dispose();
   }
 
@@ -256,7 +331,7 @@ class _PainelPageState extends State<PainelPage> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    if (erro != null) {
+    if (erro != null && historico.isEmpty) {
       return Scaffold(
         appBar: AppBar(title: const Text('Painel de localização')),
         body: Center(
@@ -285,6 +360,7 @@ class _PainelPageState extends State<PainelPage> {
     final atual = historico.first;
     final rota = historico
         .reversed
+        .where((e) => e.event != 'heartbeat')
         .map((e) => LatLng(e.latitude, e.longitude))
         .toList();
 
@@ -301,6 +377,13 @@ class _PainelPageState extends State<PainelPage> {
       ),
       body: Column(
         children: [
+          if (erro != null)
+            MaterialBanner(
+              content: Text(erro!),
+              actions: [
+                TextButton(onPressed: atualizar, child: const Text('Tentar')),
+              ],
+            ),
           SizedBox(
             height: 310,
             child: FlutterMap(
@@ -342,10 +425,7 @@ class _PainelPageState extends State<PainelPage> {
               children: [
                 const Icon(Icons.timeline),
                 const SizedBox(width: 8),
-                Text(
-                  'Linha do tempo',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
+                Text('Linha do tempo', style: Theme.of(context).textTheme.titleLarge),
                 const Spacer(),
                 Text('${historico.length} registros'),
               ],
@@ -357,11 +437,10 @@ class _PainelPageState extends State<PainelPage> {
               child: ListView.builder(
                 physics: const AlwaysScrollableScrollPhysics(),
                 itemCount: historico.length,
-                itemBuilder: (context, index) {
-                  final item = historico[index];
-                  final isLast = index == historico.length - 1;
-                  return TimelineItem(item: item, isLast: isLast);
-                },
+                itemBuilder: (context, index) => TimelineItem(
+                  item: historico[index],
+                  isLast: index == historico.length - 1,
+                ),
               ),
             ),
           ),
@@ -379,12 +458,12 @@ class TimelineItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final movimento = item.event == 'movement';
     final titulo = switch (item.event) {
       'startup' => 'Monitoramento iniciado',
       'heartbeat' => 'Sinal de atividade',
       _ => 'Movimento detectado',
     };
+    final movimento = item.event == 'movement';
 
     return IntrinsicHeight(
       child: Row(
@@ -395,10 +474,7 @@ class TimelineItem extends StatelessWidget {
             child: Column(
               children: [
                 const SizedBox(height: 12),
-                Icon(
-                  movimento ? Icons.directions_walk : Icons.circle,
-                  size: movimento ? 24 : 14,
-                ),
+                Icon(movimento ? Icons.directions_walk : Icons.circle, size: movimento ? 24 : 14),
                 if (!isLast)
                   Expanded(
                     child: Container(
@@ -420,20 +496,12 @@ class TimelineItem extends StatelessWidget {
                   children: [
                     Row(
                       children: [
-                        Expanded(
-                          child: Text(
-                            titulo,
-                            style: Theme.of(context).textTheme.titleMedium,
-                          ),
-                        ),
+                        Expanded(child: Text(titulo, style: Theme.of(context).textTheme.titleMedium)),
                         Text(formatarData(item.time)),
                       ],
                     ),
                     const SizedBox(height: 6),
-                    Text(
-                      '${item.latitude.toStringAsFixed(6)}, '
-                      '${item.longitude.toStringAsFixed(6)}',
-                    ),
+                    Text('${item.latitude.toStringAsFixed(6)}, ${item.longitude.toStringAsFixed(6)}'),
                     const SizedBox(height: 4),
                     Text(
                       'Precisão: ${item.accuracy?.toStringAsFixed(0) ?? '-'} m'
@@ -494,9 +562,7 @@ class LocationRecord {
       accuracy: number(json['accuracy']),
       speed: number(json['speed']),
       event: json['event']?.toString() ?? 'movement',
-      time: DateTime.parse(
-        (json['client_time'] ?? json['created_at']).toString(),
-      ),
+      time: DateTime.parse((json['client_time'] ?? json['created_at']).toString()),
     );
   }
 }
