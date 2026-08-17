@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 
@@ -12,6 +13,9 @@ const trackedDeviceId = String.fromEnvironment(
   'DEVICE_ID',
   defaultValue: 'celular-01',
 );
+
+const _secureStorage = FlutterSecureStorage();
+const _refreshTokenKey = 'supabase_refresh_token';
 
 void main() => runApp(const PainelApp());
 
@@ -24,7 +28,7 @@ class PainelApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Painel de Localização',
       theme: ThemeData(useMaterial3: true),
-      home: const LoginPage(),
+      home: const SessionGate(),
     );
   }
 }
@@ -34,6 +38,98 @@ class SessionData {
 
   String accessToken;
   String refreshToken;
+}
+
+Future<void> salvarSessao(String refreshToken) {
+  return _secureStorage.write(key: _refreshTokenKey, value: refreshToken);
+}
+
+Future<void> apagarSessao() {
+  return _secureStorage.delete(key: _refreshTokenKey);
+}
+
+Future<SessionData?> renovarComRefreshToken(String refreshToken) async {
+  if (refreshToken.isEmpty || supabaseUrl.isEmpty || supabaseAnonKey.isEmpty) {
+    return null;
+  }
+
+  try {
+    final response = await http
+        .post(
+          Uri.parse('$supabaseUrl/auth/v1/token?grant_type=refresh_token'),
+          headers: {
+            'apikey': supabaseAnonKey,
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'refresh_token': refreshToken}),
+        )
+        .timeout(const Duration(seconds: 20));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) return null;
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final accessToken = data['access_token']?.toString() ?? '';
+    final novoRefreshToken = data['refresh_token']?.toString() ?? refreshToken;
+    if (accessToken.isEmpty) return null;
+
+    await salvarSessao(novoRefreshToken);
+    return SessionData(
+      accessToken: accessToken,
+      refreshToken: novoRefreshToken,
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+class SessionGate extends StatefulWidget {
+  const SessionGate({super.key});
+
+  @override
+  State<SessionGate> createState() => _SessionGateState();
+}
+
+class _SessionGateState extends State<SessionGate> {
+  @override
+  void initState() {
+    super.initState();
+    _abrir();
+  }
+
+  Future<void> _abrir() async {
+    final refreshToken = await _secureStorage.read(key: _refreshTokenKey) ?? '';
+    if (!mounted) return;
+
+    if (refreshToken.isEmpty) {
+      _irPara(const LoginPage());
+      return;
+    }
+
+    final session = await renovarComRefreshToken(refreshToken);
+    if (!mounted) return;
+
+    if (session == null) {
+      await apagarSessao();
+      if (!mounted) return;
+      _irPara(const LoginPage());
+      return;
+    }
+
+    _irPara(PainelPage(session: session));
+  }
+
+  void _irPara(Widget page) {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => page),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      body: Center(child: CircularProgressIndicator()),
+    );
+  }
 }
 
 class LoginPage extends StatefulWidget {
@@ -93,6 +189,8 @@ class _LoginPageState extends State<LoginPage> {
         if (mounted) setState(() => erro = 'Sessão não recebida do servidor.');
         return;
       }
+
+      await salvarSessao(refreshToken);
 
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
@@ -212,30 +310,22 @@ class _PainelPageState extends State<PainelPage> {
       };
 
   Future<bool> renovarSessao() async {
-    try {
-      final response = await http
-          .post(
-            Uri.parse('$supabaseUrl/auth/v1/token?grant_type=refresh_token'),
-            headers: {
-              'apikey': supabaseAnonKey,
-              'Content-Type': 'application/json',
-            },
-            body: jsonEncode({'refresh_token': widget.session.refreshToken}),
-          )
-          .timeout(const Duration(seconds: 20));
+    final novaSessao = await renovarComRefreshToken(widget.session.refreshToken);
+    if (novaSessao == null) return false;
 
-      if (response.statusCode < 200 || response.statusCode >= 300) return false;
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final accessToken = data['access_token']?.toString() ?? '';
-      final refreshToken = data['refresh_token']?.toString() ?? '';
-      if (accessToken.isEmpty) return false;
+    widget.session.accessToken = novaSessao.accessToken;
+    widget.session.refreshToken = novaSessao.refreshToken;
+    return true;
+  }
 
-      widget.session.accessToken = accessToken;
-      if (refreshToken.isNotEmpty) widget.session.refreshToken = refreshToken;
-      return true;
-    } catch (_) {
-      return false;
-    }
+  Future<void> sair() async {
+    timer?.cancel();
+    await apagarSessao();
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginPage()),
+      (_) => false,
+    );
   }
 
   Future<http.Response> getAutenticado(Uri uri) async {
@@ -484,7 +574,16 @@ class _PainelPageState extends State<PainelPage> {
 
     if (erro != null && historico.isEmpty) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Painel de localização')),
+        appBar: AppBar(
+          title: const Text('Painel de localização'),
+          actions: [
+            IconButton(
+              onPressed: sair,
+              icon: const Icon(Icons.logout),
+              tooltip: 'Sair',
+            ),
+          ],
+        ),
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
@@ -520,6 +619,11 @@ class _PainelPageState extends State<PainelPage> {
             onPressed: atualizar,
             icon: const Icon(Icons.refresh),
             tooltip: 'Atualizar',
+          ),
+          IconButton(
+            onPressed: sair,
+            icon: const Icon(Icons.logout),
+            tooltip: 'Sair',
           ),
         ],
       ),
