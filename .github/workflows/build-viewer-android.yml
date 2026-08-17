@@ -1,0 +1,55 @@
+name: Build Viewer Android APK
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "viewer_app/**"
+      - ".github/workflows/build-viewer-android.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar projeto
+        uses: actions/checkout@v4
+
+      - name: Instalar Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.0"
+          channel: stable
+          cache: true
+
+      - name: Criar projeto Android temporario
+        run: |
+          flutter create --platforms=android --project-name rastreador_painel viewer_build
+          cp viewer_app/pubspec.yaml viewer_build/pubspec.yaml
+          cp viewer_app/lib/main.dart viewer_build/lib/main.dart
+
+      - name: Instalar dependencias
+        working-directory: viewer_build
+        run: flutter pub get
+
+      - name: Compilar painel
+        working-directory: viewer_build
+        run: >-
+          flutter build apk --debug
+          --dart-define=SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          --dart-define=SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+          --dart-define=DEVICE_ID=celular-01
+
+      - name: Salvar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: painel-localizacao-apk
+          path: viewer_build/build/app/outputs/flutter-apk/app-debug.apk
