@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "viewer_app/**"
+      - ".github/workflows/build-viewer-android.yml"
   workflow_dispatch:
 
 jobs:
@@ -15,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Instalar Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
