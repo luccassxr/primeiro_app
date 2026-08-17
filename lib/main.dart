@@ -58,19 +58,28 @@ void onStart(ServiceInstance service) async {
   }
 
   StreamSubscription<Position>? subscription;
+  Timer? heartbeatTimer;
   Position? ultimaPosicao;
+  var encerrando = false;
 
-  service.on('stop').listen((_) async {
+  Future<void> encerrar() async {
+    if (encerrando) return;
+    encerrando = true;
+    heartbeatTimer?.cancel();
     await subscription?.cancel();
     await service.stopSelf();
-  });
+  }
+
+  service.on('stop').listen((_) => encerrar());
 
   if (!backendConfigurado) {
-    debugPrint('Backend não configurado. Serviço iniciado sem envio remoto.');
+    debugPrint('Backend não configurado. Encerrando serviço.');
+    await encerrar();
     return;
   }
 
   Future<void> enviarPosicao(Position position, String evento) async {
+    if (encerrando) return;
     ultimaPosicao = position;
 
     final uri = Uri.parse('$supabaseUrl/rest/v1/locations');
@@ -100,14 +109,9 @@ void onStart(ServiceInstance service) async {
           .timeout(const Duration(seconds: 15));
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        debugPrint(
-          'Falha ao enviar localização: ${response.statusCode} ${response.body}',
-        );
+        debugPrint('Falha ao enviar localização: ${response.statusCode} ${response.body}');
       } else {
-        debugPrint(
-          'Localização enviada ($evento): '
-          '${position.latitude}, ${position.longitude}',
-        );
+        debugPrint('Localização enviada ($evento): ${position.latitude}, ${position.longitude}');
       }
     } catch (e) {
       debugPrint('Erro de rede ao enviar localização: $e');
@@ -116,32 +120,26 @@ void onStart(ServiceInstance service) async {
 
   try {
     final inicial = await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-      ),
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
     );
     await enviarPosicao(inicial, 'startup');
   } catch (e) {
     debugPrint('Não foi possível obter a posição inicial: $e');
   }
 
-  const settings = LocationSettings(
-    accuracy: LocationAccuracy.high,
-    distanceFilter: 25,
-  );
-
   subscription = Geolocator.getPositionStream(
-    locationSettings: settings,
+    locationSettings: const LocationSettings(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: 25,
+    ),
   ).listen(
     (position) => enviarPosicao(position, 'movement'),
-    onError: (Object erro) {
-      debugPrint('Erro no fluxo de localização: $erro');
-    },
+    onError: (Object erro) => debugPrint('Erro no fluxo de localização: $erro'),
   );
 
-  Timer.periodic(const Duration(minutes: 15), (_) async {
+  heartbeatTimer = Timer.periodic(const Duration(minutes: 15), (_) async {
     final position = ultimaPosicao;
-    if (position != null) {
+    if (position != null && !encerrando) {
       await enviarPosicao(position, 'heartbeat');
     }
   });
@@ -190,7 +188,6 @@ class _TelaConfiguracaoState extends State<TelaConfiguracao> {
 
   Future<void> ativarMonitoramento() async {
     if (processando) return;
-
     setState(() => processando = true);
 
     try {
@@ -203,33 +200,30 @@ class _TelaConfiguracaoState extends State<TelaConfiguracao> {
       }
 
       if (!await Geolocator.isLocationServiceEnabled()) {
-        setState(() => status = 'Ative a localização do celular');
+        if (mounted) setState(() => status = 'Ative a localização do celular');
         await Geolocator.openLocationSettings();
         return;
       }
 
       var permissao = await Geolocator.checkPermission();
-
       if (permissao == LocationPermission.denied) {
         permissao = await Geolocator.requestPermission();
       }
 
       if (permissao == LocationPermission.deniedForever) {
-        setState(() => status = 'Permissão bloqueada');
-        _mostrar(
-          'Abra as configurações do app e permita localização.',
-        );
+        if (mounted) setState(() => status = 'Permissão bloqueada');
+        _mostrar('Abra as configurações do app e permita localização.');
         await Geolocator.openAppSettings();
         return;
       }
 
       if (permissao == LocationPermission.denied) {
-        setState(() => status = 'Permissão negada');
+        if (mounted) setState(() => status = 'Permissão negada');
         return;
       }
 
       if (permissao != LocationPermission.always) {
-        setState(() => status = 'Falta permitir em segundo plano');
+        if (mounted) setState(() => status = 'Falta permitir em segundo plano');
         _mostrar(
           'Nas configurações do app, escolha Localização > Permitir o tempo todo. '
           'Depois volte e toque em Ativar novamente.',
@@ -264,9 +258,7 @@ class _TelaConfiguracaoState extends State<TelaConfiguracao> {
 
   void _mostrar(String mensagem) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(mensagem)),
-    );
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(mensagem)));
   }
 
   @override
